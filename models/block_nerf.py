@@ -1,221 +1,168 @@
 import torch
-import json
-from pathlib import Path
-from tqdm import tqdm
-from pytorch_lightning import LightningModule
-from models.mip_nerf import MipNerf, Visibility
-from models.mip import rearrange_render_image
-from utils.metrics import calc_psnr
-# from datasets import dataset_dict
-from datasets.filesystem_dataset import FilesystemDataset, Rays
-from datasets.memory_dataset import WaymoDataset, Rays
-from datasets.decoder_utils import axisangle_to_R
-from utils.lr_schedule import MipLRDecay
-from torch.utils.data import DataLoader
-from utils.vis import stack_rgb, visualize_depth
-from typing import NamedTuple
+from torch import nn
 
-class BlockNeRFSystem(LightningModule):
-    def __init__(self, hparams):
-        super(BlockNeRFSystem, self).__init__()
-        self.save_hyperparameters(hparams)
-        self.train_randomized = hparams['train.randomized']
-        self.val_randomized = hparams['val.randomized']
-        self.val_chunk_size = hparams['val.chunk_size']
-        self.batch_size = self.hparams['train.batch_size']
-        self.image_hashs_dict, self.val_hashs_dict = self._get_image_metadata()
-        assert len(self.image_hashs_dict)>0 and len(self.val_hashs_dict)>0, 'make sure train and val data large 0'
-        kwargs = {
-            'num_samples':hparams['nerf.num_samples'],
-            'mlp_net_width':hparams['nerf.mlp.net_width'],
-            'deg_exposure': hparams['nerf.mlp.deg_exposure'],
-            'appearance_dim': hparams['nerf.mlp.appearance_dim'],
-            'disparity':hparams['nerf.disparity'],
-            'appearance_count':len(self.image_hashs_dict),
-            'visib':Visibility()
-        }
-        self.mip_nerf = MipNerf(**kwargs)
+class InterPosEmbedding(nn.Module):  # 给位置编码
+    def __init__(self, N_freqs=10):
+        super(InterPosEmbedding, self).__init__()
+        self.N_freqs = N_freqs
+        self.funcs = [torch.sin, torch.cos]
 
-        if self.hparams['optimize_ext']:
-            N = len(self.image_hashs_dict)
-            self.register_parameter('dR',
-                torch.nn.Parameter(torch.zeros(N, 3, device=self.device)))
-            self.register_parameter('dT',
-                torch.nn.Parameter(torch.zeros(N, 3, device=self.device)))        
-        # self.visib = Visibility()
-        self._setup()
+        # [2^0,2^1,...,2^(n-1)]:给sin用
+        self.freq_band_1 = 2 ** torch.linspace(0, N_freqs - 1, N_freqs)
+        # [4^0,4^1,...,4^(n-1)]:给diag(∑)用
+        self.freq_band_2 = self.freq_band_1 ** 2
 
-    def forward(self, batch_rays: NamedTuple, randomized: bool, white_bkgd: bool=False):
-        if self.hparams['optimize_ext']:
-            dR = axisangle_to_R(self.dR[batch_rays.image_indices.long().squeeze(-1)])
-            dt = self.dT[batch_rays.image_indices.long().squeeze(-1)]
-            directions = (batch_rays.directions.unsqueeze(1) @ dR.permute([0, 2, 1])).squeeze(1)
-            origins = batch_rays.origins + dt
-            batch_rays = Rays(origins, directions, directions, batch_rays.radii, batch_rays.lossmult, batch_rays.near, batch_rays.far, batch_rays.image_indices, batch_rays.exposures)
-
-        res = self.mip_nerf(batch_rays, randomized, white_bkgd)  # num_layers result
-        return res
-
-    def _setup(self):
-        # dataset = FilesystemDataset
-        dataset = WaymoDataset
-        self.train_dataset = dataset(self.image_hashs_dict, self.hparams['data_path'], self.hparams['img_nums'],\
-                                     near=self.hparams['near'], far=self.hparams['far'])
-        self.val_dataset = dataset(self.val_hashs_dict, self.hparams['data_path'], self.hparams['img_nums'], \
-                                     near=self.hparams['near'], far=self.hparams['far'], split='validation')
-        
-        # self.refresh_datasets()
+    def forward(self, μ, diagE):
+        # exmbeds [μ,diagE] -> [sin(μ)*exp(-1/2)*diag(∑γ),cos(μ)*exp(-1/2)*diag(∑γ),...,
+        # sin(2^(L-1)*μ)*exp(-1/2)*4^(L-1)*diag(∑)]
+        sin_out = []
+        sin_cos = []
+        for freq in self.freq_band_1:
+            for func in self.funcs:
+                sin_cos.append(func(freq * μ))
+            sin_out.append(sin_cos)
+            sin_cos = []
+        # sin_out:list:[sin(μ),cos(μ)]
+        diag_out = []
+        for freq in self.freq_band_2:
+            diag_out.append(freq * diagE)
+        # diag_out:list:[4^(L-1)*diag(∑)]
+        out = []
+        for sc_γ, diag_Eγ in zip(sin_out, diag_out):
+            # torch.exp(-0.5 * x_var) * torch.sin(x)
+            for sin_cos in sc_γ:  # [sin,cos]
+                out.append(sin_cos * torch.exp(-0.5 * diag_Eγ))
+        return torch.cat(out, -1)
 
 
-    def _get_image_metadata(self):
-        dataset_path = Path(self.hparams['data_path'])
-        with open(dataset_path/'blocks_meta_train.json', 'r') as f:
-            block_train = json.load(f)
-            block_train = block_train[str(self.hparams['block_id'])]
-        with open(dataset_path/'blocks_meta_validation.json', 'r') as f:
-            block_val = json.load(f)
-            block_val = block_val[str(self.hparams['block_id'])]
-        index = 0
-        image_hashs_dict = {}
-        for key, value in block_train['block_items'].items():
-            for val in value:
-                image_hashs_dict[val] = {
-                    'tfrecord': key,
-                    'type': 'train',
-                    'index': index,
-                }
-                index += 1
-        val_hashs_dict = {}
-        for key, value in block_val['block_items'].items():
-            for val in value:
-                image_hashs_dict[val] = {
-                    'tfrecord': key,
-                    'type': 'validation',
-                    'index': index,
-                }
-                val_hashs_dict[val] = {
-                    'tfrecord': key,
-                    'type': 'validation',
-                    'index': index,
-                }
-                index += 1
-        del block_train, block_val
-        return image_hashs_dict, val_hashs_dict
+class PosEmbedding(nn.Module):  # 给方向编码
+    def __init__(self, N_freqs):
+        """
+        Defines a function that embeds x to (x, sin(2^k x), cos(2^k x), ...)
+        in_channels: number of input channels (3 for both xyz and direction)
+        """
+        super().__init__()
+        self.N_freqs = N_freqs
+        self.funcs = [torch.sin, torch.cos]
+        # [2^0,2^1,...,2^(n-1)]
+        self.freq_bands = 2 ** torch.linspace(0, N_freqs - 1, N_freqs)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.mip_nerf.parameters(), lr=self.hparams['optimizer.lr_init'])
-        scheduler = MipLRDecay(optimizer, self.hparams['optimizer.lr_init'], self.hparams['optimizer.lr_final'],
-                               self.hparams['optimizer.max_steps'], self.hparams['optimizer.lr_delay_steps'],
-                               self.hparams['optimizer.lr_delay_mult'])
-        return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
+    def forward(self, x):
+        out = []
+        for freq in self.freq_bands:  # [2^0,2^1,...,2^(n-1)]
+            for func in self.funcs:
+                out += [func(freq * x)]
+        # !!!!相当于63维，多了三个基础坐标——>[x,y,z,sin(2^0Πpi),cos.......]
+        # xyz——>63,dir——>27
+        return torch.cat(out, -1)  # 变成一个63的元素
 
-    def refresh_datasets(self):
-        self.train_dataset.load_chunk()
-        self.val_dataset.load_chunk()
+class Block_NeRF(nn.Module):
+    def __init__(self, D=8, W=256, skips=[4],
+                 in_channel_xyz=60, in_channel_dir=24,
+                 in_channel_exposure=8,  # exposure只有一维，而dir有三维
+                 in_channel_appearance=32,
+                 # in_channel_transient=16,
 
-    def train_dataloader(self):
-        # self.train_dataset.load_chunk()
-        # print('choose train index chosen_index-> {}'.format(self.train_dataset.chosen_index))
-        return DataLoader(self.train_dataset,
-                          shuffle=True,
-                          num_workers=self.hparams['train.num_work'],
-                          batch_size=self.hparams['train.batch_size'],
-                          pin_memory=True)
+                 ):
+        # 输入：[xyz60,dir24,exposure24,appearance24]
+        super(Block_NeRF, self).__init__()
+        self.D = D
+        self.W = W
+        self.skips = skips
+        self.in_channel_xyz = in_channel_xyz
+        self.in_channel_dir = in_channel_dir
+        self.in_channel_exposure = in_channel_exposure
+        self.in_channel_appearance = in_channel_appearance
+        # self.in_channel_transient = in_channel_transient
 
-    def val_dataloader(self):
-        # must give 1 worker
-        # self.val_dataset.load_chunk()
-        # print('choose val index chosen_index-> {}'.format(self.val_dataset.chosen_index))
-        return DataLoader(self.val_dataset,
-                          shuffle=False,
-                          num_workers=1,
-                          # validate one image (H*W rays) at a time
-                          batch_size=1,
-                          pin_memory=True,
-                          persistent_workers=True)
-
-    def training_step(self, batch, batch_nb):
-        rays, rgbs = batch
-        ret = self(rays, self.train_randomized)
-        # calculate loss for coarse and fine
-        mask = rays.lossmult
-        if self.hparams['loss.disable_multiscale_loss']:
-            mask = torch.ones_like(mask)
-
-        loss = 0
-        loss += self.hparams['loss.coarse_loss_mult'] * (mask * (ret['rgb_coarse'] - rgbs[..., :3]) ** 2).sum() / mask.sum()
-        loss += (mask * (ret['rgb_fine'] - rgbs[..., :3]) ** 2).sum() / mask.sum()
-       
-        loss += 1e-6 * (mask *(ret[f'visib_trans_fine'].squeeze(-1)-ret[f'trans_fine'].detach())**2).sum() / mask.sum()
-        loss += self.hparams['loss.coarse_loss_mult'] * 1e-6 * (mask *(ret[f'visib_trans_coarse'].squeeze(-1)-ret[f'trans_coarse'].detach())**2).sum() / mask.sum()
-        
-        if self.hparams['optimize_ext']:
-            dR = self.dR[rays.image_indices.long().squeeze(-1)]
-            dt = self.dT[rays.image_indices.long().squeeze(-1)]
-            if self.global_step < 10000:
-                # TODO this is may be a hyper param, the paper said 5000 steps
-                loss += 1e5 * ((dR**2).mean() + (dt**2).mean())
+        for i in range(D):
+            if i == 0:
+                layer = nn.Linear(in_channel_xyz, W)
+            elif i in skips:
+                layer = nn.Linear(W + in_channel_xyz, W)
             else:
-                scale = (0.1 - 1e5) * (self.global_step-10000)/(self.hparams['optimizer.max_steps']-10000) + 1e5
-                loss += scale * ((dR**2).mean() + (dt**2).mean())
+                layer = nn.Linear(W, W)
+            layer = nn.Sequential(layer, nn.ReLU(True))
+            setattr(self, f'xyz_encoding_{i + 1}', layer)
+        self.xyz_encoding_final = nn.Linear(W, W)
 
-        with torch.no_grad():
-            psnr_fine = calc_psnr(ret['rgb_fine'], rgbs[..., :3])
-        self.log('lr', self.optimizers().optimizer.param_groups[0]['lr'])
-        self.log('train/loss', loss)
-        self.log('train/psnr', psnr_fine, prog_bar=True)
-        return loss
+        # 3层128
+        self.dir_encoding = nn.Sequential(  # RGB由dir,Exposure,Appearance决定
+            nn.Linear(
+                W + in_channel_dir + in_channel_appearance + in_channel_exposure,
+                W // 2
+            ), nn.ReLU(True),
+            nn.Linear(W // 2, W // 2), nn.ReLU(True),
+            nn.Linear(W // 2, W // 2), nn.ReLU(True)
+        )
 
-    def validation_step(self, batch, batch_nb):
-        _, rgbs = batch
-        rgb_gt = rgbs[..., :3]
-        coarse_rgb, fine_rgb, val_mask = self.render_image(batch)
+        self.static_sigma = nn.Sequential(nn.Linear(W, 1), nn.Softplus())
+        self.static_rgb = nn.Sequential(nn.Linear(W // 2, 3), nn.Sigmoid())
 
-        val_mse_coarse = (val_mask * (coarse_rgb - rgb_gt)** 2).sum() / val_mask.sum()
-        val_mse_fine = (val_mask * (fine_rgb - rgb_gt)** 2).sum() / val_mask.sum()
+    def forward(self, x, sigma_only=False):
+        if sigma_only:
+            input_xyz = x
+        else:
+            input_xyz, input_dir, input_exp, input_appear = torch.split(x, [self.in_channel_xyz, self.in_channel_dir,
+                                                                        self.in_channel_exposure,
+                                                                        self.in_channel_appearance], dim=-1)
+        xyz = input_xyz
+        for i in range(self.D):
+            if i in self.skips:
+                xyz = torch.cat([xyz, input_xyz], dim=-1)
+            xyz = getattr(self, f'xyz_encoding_{i + 1}')(xyz)
 
-        val_loss = self.hparams['loss.coarse_loss_mult'] * val_mse_coarse + val_mse_fine
+        static_sigma = self.static_sigma(xyz)
+        if sigma_only:
+            return static_sigma
 
-        val_psnr_fine = calc_psnr(fine_rgb, rgb_gt)
+        xyz_feature = self.xyz_encoding_final(xyz)
+        dir_encoding = self.dir_encoding(
+            torch.cat([xyz_feature, input_dir, input_exp, input_appear], dim=-1))
 
-        log = {'val/loss': val_loss, 'val/psnr': val_psnr_fine}
-        stack = stack_rgb(rgb_gt, coarse_rgb, fine_rgb)  # (3, 3, H, W)
-        self.logger.experiment.add_images('val/GT_coarse_fine',
-                                          stack, self.global_step)
-        return log
+        static_rgb = self.static_rgb(dir_encoding)
+        static_rgb_sigma = torch.cat([static_rgb, static_sigma], dim=-1)
 
-    def validation_epoch_end(self, outputs):
-        mean_loss = torch.stack([x['val/loss'] for x in outputs]).mean()
-        mean_psnr = torch.stack([x['val/psnr'] for x in outputs]).mean()
+        return static_rgb_sigma
 
-        self.log('val/loss', mean_loss)
-        self.log('val/psnr', mean_psnr, prog_bar=True)
-        # self.refresh_datasets()
 
-    def render_image(self, batch):
-        rays, rgbs = batch
-        _, height, width, _ = rgbs.shape  # N H W C
-        single_image_rays, val_mask = rearrange_render_image(
-            rays, self.val_chunk_size)
-        coarse_rgb, fine_rgb = [], []
-        distances = []
-        with torch.no_grad():
-            for batch_rays in tqdm(single_image_rays):
-                ret = self(batch_rays, self.val_randomized)
-                coarse_rgb.append(ret['rgb_coarse'])
-                fine_rgb.append(ret['rgb_fine'])
-                distances.append(ret['depth_fine'])
+class Visibility(nn.Module):
+    def __init__(self,
+                 in_channel_xyz=60, in_channel_dir=24,
+                 W=128):
+        super(Visibility, self).__init__()
+        self.in_channel_xyz = in_channel_xyz
+        self.in_channel_dir = in_channel_dir
 
-        coarse_rgb = torch.cat(coarse_rgb, dim=0)
-        fine_rgb = torch.cat(fine_rgb, dim=0)
-        distances = torch.cat(distances, dim=0)
-        distances = distances.reshape(1, height, width)  # H W
-        distances = visualize_depth(distances)
-        self.logger.experiment.add_image('distance', distances, self.global_step)
+        self.vis_encoding = nn.Sequential(
+            nn.Linear(in_channel_xyz + in_channel_dir, W), nn.ReLU(True),
+            nn.Linear(W, W), nn.ReLU(True),
+            nn.Linear(W, W), nn.ReLU(True),
+            nn.Linear(W, W), nn.ReLU(True),
+        )
+        self.visibility = nn.Sequential(nn.Linear(W, 1), nn.Softplus())
 
-        coarse_rgb = coarse_rgb.reshape(
-            1, height, width, coarse_rgb.shape[-1])  # N H W C
-        fine_rgb = fine_rgb.reshape(
-            1, height, width, fine_rgb.shape[-1])  # N H W C
-        return coarse_rgb, fine_rgb, val_mask
+    def forward(self, x):
+        vis_encode = self.vis_encoding(x)
+        visibility = self.visibility(vis_encode)
+        return visibility
+
+
+def test_Block():
+    # xyz,dir,exposure,appearance
+    test_data = torch.rand([1024, 64, 60 + 24 + 8 + 32])
+    model = Block_NeRF()
+    result = model(test_data)
+    print(result.shape)
+
+
+def test_Vis():
+    test_data = torch.rand([1024, 64, 84])
+    model = Visibility()
+    result = model(test_data)
+    print()
+
+
+if __name__ == '__main__':
+    # test_Vis()
+    test_Block()

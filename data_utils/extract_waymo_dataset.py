@@ -1,28 +1,27 @@
-#   This code is used for extract the image information of the tfrecords
-
+import torch
+from kornia import create_meshgrid
 import numpy as np
 from tqdm import tqdm
+import datetime, os
+from base64 import decodestring
 import cv2
 import os
 import json
 import glob
 import tensorflow as tf
 import time
-import torch
-from kornia import create_meshgrid
+import argparse
 
-def get_cam_rays(H, W, K):
-    grid = create_meshgrid(H, W, normalized_coordinates=False)[0]
-    i, j = grid.unbind(-1)
-    # the direction here is without +0.5 pixel centering as calibration is not so accurate
-    # see https://github.com/bmild/nerf/issues/24
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    directions = \
-        torch.stack([(i - cx) / fx, -(j - cy) / fy, -torch.ones_like(i)], -1)  # (H, W, 3)
-    # 求半径
-    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
-    return directions.numpy()
 
+def get_hparams():
+    parser=argparse.ArgumentParser()
+
+    parser.add_argument("--split",type=str,default="val",
+                        help="extract the train or val")
+    parser.add_argument("--save_npy",type=bool,default=False,
+                        help="Whether save the rays_o and rays_d to the npy file")
+
+    return vars(parser.parse_args())
 
 def get_Rotate(cam_ray_dir, world_ray_dir):
     cam_ray_dir = cam_ray_dir.reshape(-1, 3)
@@ -51,7 +50,6 @@ def get_Rotate(cam_ray_dir, world_ray_dir):
 
     return R
 
-
 def decode_fn(record_bytes):
     return tf.io.parse_single_example(
         record_bytes,
@@ -68,8 +66,19 @@ def decode_fn(record_bytes):
         }
     )
 
+def get_cam_rays(H, W, K):
+    grid = create_meshgrid(H, W, normalized_coordinates=False)[0]
+    i, j = grid.unbind(-1)
+    # the direction here is without +0.5 pixel centering as calibration is not so accurate
+    # see https://github.com/bmild/nerf/issues/24
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    directions = \
+        torch.stack([(i - cx) / fx, -(j - cy) / fy, -torch.ones_like(i)], -1)  # (H, W, 3)
+    # 求半径
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    return directions.numpy()
 
-def handle_one_record(tfrecord, exist_imgs, index, stage):
+def handle_one_record(tfrecord, exist_imgs, split="train", save_npy=False):
     dataset = tf.data.TFRecordDataset(
         tfrecord,
         compression_type="GZIP",
@@ -78,8 +87,8 @@ def handle_one_record(tfrecord, exist_imgs, index, stage):
 
     os.makedirs(result_root_folder, exist_ok=True)
     meta_folder = os.path.join(result_root_folder, 'json')
-    image_folder = os.path.join(result_root_folder, "images_"+stage)
-    json_path = os.path.join(meta_folder, stage+".json")
+    image_folder = os.path.join(result_root_folder, "images")
+    json_path = os.path.join(meta_folder, split + ".json")
     os.makedirs(meta_folder, exist_ok=True)
     os.makedirs(image_folder, exist_ok=True)
 
@@ -87,10 +96,9 @@ def handle_one_record(tfrecord, exist_imgs, index, stage):
         image_name = str(int(batch["image_hash"]))
 
         if image_name + ".png" in exist_imgs:
-            #print(f"\t{image_name}.png has been loaded!")
+            # print(f"\t{image_name}.png has been loaded!")
             continue
 
-        index += 1
         imagestr = batch["image"]
         image = tf.io.decode_png(imagestr, channels=0, dtype=tf.dtypes.uint8, name=None)
         image = np.array(image)
@@ -104,13 +112,14 @@ def handle_one_record(tfrecord, exist_imgs, index, stage):
 
         ray_origins = tf.sparse.to_dense(batch["ray_origins"]).numpy().reshape(height, width, 3)
         ray_dirs = tf.sparse.to_dense(batch["ray_dirs"]).numpy().reshape(height, width, 3)
-        '''
-        with open(os.path.join(image_folder, f"{image_name}_ray_origins.npy"), "wb") as f:
-            np.save(f, ray_origins)
-        with open(os.path.join(image_folder, f"{image_name}_ray_dirs.npy"), "wb") as f:
-            np.save(f, ray_dirs)
-        '''
-        # 根据世界坐标系下的归一化rays_dir和相机坐标系下的rays_dir求得相机位姿
+        if save_npy or split=="val":
+            with open(os.path.join(image_folder, f"{image_name}_ray_origins.npy"), "wb") as f:
+                np.save(f, ray_origins)
+            with open(os.path.join(image_folder, f"{image_name}_ray_dirs.npy"), "wb") as f:
+                np.save(f, ray_dirs)
+
+        #计算相机位姿
+        K = {}
         K = np.zeros((3, 3), dtype=np.float32)
         # fx=focal,fy=focal,cx=img_w/2,cy=img_h/2
         K[0, 0] = intrinsics[0]
@@ -139,10 +148,11 @@ def handle_one_record(tfrecord, exist_imgs, index, stage):
 
         train_meta[image_name] = cur_data_dict
         with open(json_path, "w") as fp:
-            json.dump(train_meta, fp, indent=2)
+            json.dump(train_meta, fp)
             fp.close()
 
-    return index
+
+
 
 
 def get_the_current_index(root_dir):
@@ -152,11 +162,13 @@ def get_the_current_index(root_dir):
         return len(meta)
     return 0
 
+if __name__=="__main__":
+    hparams=get_hparams()
 
-if __name__ == "__main__":
-    waymo_root_p = "../data/v1.0"
-    result_root_folder = "../data/WaymoDataset"
-    ori_waymo_data = sorted(glob.glob(os.path.join(waymo_root_p, "*")))
+    waymo_root_path="../data/v1.0"
+    result_root_folder="../data/WaymoDataset"
+
+    ori_waymo_data = sorted(glob.glob(os.path.join(waymo_root_path, "*")))
     exist_img_list = sorted(glob.glob(os.path.join(result_root_folder + "/images", "*.png")))
 
     exist_imgs = []
@@ -166,10 +178,9 @@ if __name__ == "__main__":
     index = get_the_current_index(result_root_folder)
     print(f"Has loaded {index} images!")
     train_meta = {}
-    stages = ['train', 'validation']
-    for stage in stages:
-        for idx, tfrecord in enumerate(tqdm(ori_waymo_data)):
-            if stage in tfrecord:
-                print(tfrecord)
-                print(f"Handling the {idx + 1}/{len(ori_waymo_data)} tfrecord")
-                index = handle_one_record(tfrecord, exist_imgs, index, stage)
+
+    for idx,tfrecord in enumerate(tqdm(ori_waymo_data)):
+        if hparams['split'] in tfrecord:
+            print(tfrecord)
+            print(f"Handling the {idx + 1}/{len(ori_waymo_data)} tfrecord")
+            handle_one_record(tfrecord,exist_imgs,split=hparams['split'], save_npy=hparams['save_npy'])
