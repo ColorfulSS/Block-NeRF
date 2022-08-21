@@ -3,7 +3,7 @@ import torch
 from collections import defaultdict
 
 from torch.utils.data import DataLoader
-from datasets.WaymoDataset import *
+from datasets.WaymoDataSet import *
 # from datasets.WaymoDataset_test import *
 
 from models.Block_NeRF import *

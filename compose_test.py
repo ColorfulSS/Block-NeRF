@@ -12,7 +12,7 @@ from models.Block_NeRF import *
 
 import metrics
 
-import datasets.WaymoDataset
+import datasets.WaymoDataSet
 from train import *
 
 torch.backends.cudnn.benchmark = True
